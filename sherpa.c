@@ -1,10 +1,7 @@
 #include <libguile.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
-#include <sys/reboot.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,126 +10,155 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#define FIFO_PATH "/run/sherpa.fifo"
+/* Global state for the FIFO file descriptor and process tracking.  */
+static int fifo_fd = -1;
+static pid_t getty_pid = -1;
 
-/* --- Power Management --- */
-
-void kill_the_world() {
-    sync();
-    printf("\n** Terminating all processes... **\n");
-    kill(-1, SIGTERM);
-    sleep(2);
-    kill(-1, SIGKILL);
-    sync();
-    // Ivy Bridge / SSD Safety: Final flush and remount RO
-    mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
+/* Signal handler to catch shutdown requests and pass them safely.  */
+static void
+signal_handler (int sig)
+{
+  /* Forward signals or handle basic termination safely.  */
+  sync ();
+  if (sig == SIGINT || sig == SIGUSR1)
+    {
+      /* Clean up and exit, letting the kernel panic or handle the reset.  */
+      _exit (0);
+    }
 }
 
-void poweroff_handler(int sig) {
-    kill_the_world();
-    reboot(RB_POWER_OFF);
+/* Fallback shell loop if the Guile configuration fails to load.  */
+static void
+fallback_shell (void)
+{
+  pid_t pid;
+
+  printf ("** /etc/sherpa.scm missing or failed! Starting emergency shell. **\n");
+  pid = fork ();
+  if (pid == 0)
+    {
+      execl ("/bin/sh", "sh", NULL);
+      _exit (1);
+    }
+  else if (pid > 0)
+    {
+      int status;
+      waitpid (pid, &status, 0);
+    }
 }
 
-void reboot_handler(int sig) {
-    kill_the_world();
-    reboot(RB_AUTOBOOT);
-}
+/* The core initialization and supervisor loop executing inside the Guile VM.  */
+static void
+inner_main (void *closure, int argc, char **argv)
+{
+  SCM fifo_path_scm;
+  char *fifo_path = NULL;
 
-/* --- System Prep --- */
+  printf ("[SHERPK] Entering Guile VM...\n");
 
-void setup_api_filesystems() {
-    printf("** Mounting kernel API filesystems... **\n");
-    mount("proc", "/proc", "proc", 0, NULL);
-    mount("sysfs", "/sys", "sysfs", 0, NULL);
-    
-    mkdir("/run", 0755);
-    mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=32M");
-
-    mkdir("/dev/pts", 0755);
-    mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "gid=5,mode=620");
-}
-
-/* --- The Guile/Supervisor Core --- */
-
-static void inner_main(void *closure, int argc, char **argv) {
-    printf("[SHERPK] Entering Guile VM...\n");
-
-    /* Load the Master Script */
-    if (access("/etc/sherpa.scm", R_OK) == 0) {
-        scm_c_primitive_load("/etc/sherpa.scm");
-    } else {
-        printf("** /etc/sherpa.scm missing! /bin/sh? **\n");
-        system("/bin/sh");
+  if (access ("/etc/sherpa.scm", R_OK) == 0)
+    {
+      scm_c_primitive_load ("/etc/sherpa.scm");
+    }
+  else
+    {
+      fallback_shell ();
     }
 
-    int fifo_fd = *(int *)closure;
-    pid_t getty_pid = -1;
+  /* Look up the FIFO path variable defined within the Scheme script.  */
+  fifo_path_scm = scm_lookup_closure_with_flags (scm_from_utf8_symbol ("%fifo-path"), 
+                                                 SCM_BOOL_F);
+  
+  if (scm_is_true (fifo_path_scm))
+    {
+      SCM val = scm_variable_ref (fifo_path_scm);
+      if (scm_is_string (val))
+        fifo_path = scm_to_utf8_string (val);
+    }
 
-    /* Supervisor Loop */
-    while (1) {
-        // 1. Check IPC for commands
-        char buf[64];
-        ssize_t cmd_len = read(fifo_fd, buf, sizeof(buf) - 1);
-        if (cmd_len > 0) {
-            buf[cmd_len] = '\0';
-            if (strstr(buf, "reboot")) reboot_handler(0);
-            if (strstr(buf, "halt") || strstr(buf, "off")) poweroff_handler(0);
-        }
+  /* Default path fallback if not specified by the Scheme environment.  */
+  if (!fifo_path)
+    fifo_path = strdup ("/var/run/sherpa.fifo");
 
-        // 2. Keep TTY1 Alive (The Shepherd's Watch)
-        if (getty_pid <= 0) {
-            getty_pid = fork();
-            if (getty_pid == 0) {
-                setsid();
-                int fd = open("/dev/tty1", O_RDWR);
-                if (fd >= 0) {
-                    ioctl(fd, TIOCSCTTY, 1);
-                    dup2(fd, 0); dup2(fd, 1); dup2(fd, 2);
-                    if (fd > 2) close(fd);
+  /* Initialize the named pipe based on the Guile-provided path.  */
+  unlink (fifo_path);
+  if (mkfifo (fifo_path, 0600) == 0)
+    {
+      fifo_fd = open (fifo_path, O_RDONLY | O_NONBLOCK);
+    }
+
+  /* Main SysVinit supervisor and sub-reaper cycle.  */
+  while (1)
+    {
+      int status;
+      pid_t reaped;
+
+      /* Check the command channel if it was successfully opened.  */
+      if (fifo_fd >= 0)
+        {
+          char buf[64];
+          ssize_t cmd_len = read (fifo_fd, buf, sizeof (buf) - 1);
+          if (cmd_len > 0)
+            {
+              buf[cmd_len] = '\0';
+              if (strstr (buf, "reboot") || strstr (buf, "halt"))
+                {
+                  free (fifo_path);
+                  sync ();
+                  _exit (0);
                 }
-                execl("/sbin/agetty", "agetty", "--noclear", "tty1", "115200", "linux", NULL);
-                _exit(1);
             }
         }
 
-        // 3. Sub-Reaper: Clean up zombies
-        int status;
-        pid_t reaped;
-        while ((reaped = waitpid(-1, &status, WNOHANG)) > 0) {
-            if (reaped == getty_pid) {
-                printf("** Teletype 1 died. Restarting... **\n");
-                getty_pid = -1;
+      /* Respawn manager for the primary system console.  */
+      if (getty_pid <= 0)
+        {
+          getty_pid = fork ();
+          if (getty_pid == 0)
+            {
+              setsid ();
+              /* Cross-platform friendly shell execution.  */
+              execl ("/bin/sh", "sh", "-i", NULL);
+              _exit (1);
             }
         }
 
-        usleep(100000); // 100ms duty cycle
+      /* Monitor and reap orphaned processes or dead children.  */
+      while ((reaped = waitpid (-1, &status, WNOHANG)) > 0)
+        {
+          if (reaped == getty_pid)
+            {
+              printf ("** Primary console process terminated. Restarting... **\n");
+              getty_pid = -1;
+            }
+        }
+
+      /* Brief execution pause to mitigate high processor utilization.  */
+      usleep (100000);
     }
+
+  free (fifo_path);
 }
 
-/* --- Entry --- */
-
-int main(int argc, char **argv) {
-    if (getpid() != 1) {
-        fprintf(stderr, "** Must be ran as PID 1. **\n");
-        return 1;
+/* System entry point verifying PID 1 state and booting the runtime.  */
+int
+main (int argc, char **argv)
+{
+  if (getpid () != 1)
+    {
+      fprintf (stderr, "** Error: Must be executed as PID 1. **\n");
+      return 1;
     }
 
-    setup_api_filesystems();
-    mount(NULL, "/", NULL, MS_REMOUNT, NULL); // Go RW
+  /* Configure essential platform signals uniformly.  */
+  signal (SIGUSR1, signal_handler);
+  signal (SIGINT,  signal_handler);
+  signal (SIGCHLD, SIG_DFL);
 
-    // Signal Management
-    signal(SIGUSR1, poweroff_handler);
-    signal(SIGINT,  reboot_handler); // Ctrl-Alt-Del
-    reboot(RB_DISABLE_CAD);
+  printf ("\n** sherpa - a fine man's init **\n");
 
-    // IPC Setup
-    unlink(FIFO_PATH);
-    mkfifo(FIFO_PATH, 0600);
-    int fifo_fd = open(FIFO_PATH, O_RDONLY | O_NONBLOCK);
+  /* Hand control over to the GNU Guile subsystem.  */
+  scm_boot_guile (argc, argv, inner_main, NULL);
 
-    printf("\n** sherpa - a fine man\'s init **\n");
-
-    scm_boot_guile(argc, argv, inner_main, &fifo_fd);
-
-    return 0; 
+  return 0;
 }
